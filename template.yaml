@@ -120,7 +120,7 @@ Resources:
               - Sid: ReadThroughDax
                 Effect: Allow
                 Action: [dax:GetItem]
-                Resource: !GetAtt DaxCluster.ClusterArn
+                Resource: !GetAtt DaxCluster.Arn
               - Sid: VpcNetworkInterfaces
                 Effect: Allow
                 Action:
