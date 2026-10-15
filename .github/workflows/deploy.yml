@@ -44,9 +44,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Install function dependencies (esbuild + DAX client)
-        working-directory: src
-        run: npm install --no-audit --no-fund
+      # SAM bundles the function from a temporary copy of src/, where it does not see
+      # a dev dependency. esbuild must be on the PATH (SAM installs the DAX client itself).
+      - name: Install esbuild
+        run: npm install -g esbuild
 
       - name: Validate template
         run: sam validate --lint

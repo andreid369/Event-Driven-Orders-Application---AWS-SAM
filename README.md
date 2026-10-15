@@ -108,15 +108,15 @@ aws configure                      # access key, secret key, region (e.g. eu-cen
 aws sts get-caller-identity        # confirm which account you are using
 ```
 
-### Step 4.2 – Install the function tooling
+### Step 4.2 – Install esbuild
+
+`sam build` bundles the function with esbuild, which must be available on your `PATH`
+(SAM installs the function's own dependencies, such as the DAX client, by itself):
 
 ```bash
-cd src
-npm install
-cd ..
+npm install -g esbuild
+esbuild --version
 ```
-
-Commit the generated `src/package-lock.json` (reproducible builds).
 
 ### Step 4.3 – Validate and build
 
@@ -220,7 +220,7 @@ Optional *Variables* tab (not secrets): `ENABLE_DAX` and `ENABLE_API_CACHE`, `tr
 `.github/workflows/deploy.yml` runs on every push to `main` (and manually via *Actions → Run workflow*):
 
 1. check out → set up Node 22 and SAM CLI → configure AWS credentials from the secrets
-2. `npm install` in `src/` → `sam validate --lint` → `sam build` (esbuild)
+2. `npm install -g esbuild` → `sam validate --lint` → `sam build` (esbuild)
 3. `sam deploy` – uploads the package to S3 and updates the CloudFormation stack **and** the Lambda function code
 4. prints the stack outputs
 
