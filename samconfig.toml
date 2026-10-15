@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "orders-app"
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+# Change to the region you want to use (check that DAX is available there).
+region = "eu-central-1"

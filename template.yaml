@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Project 4 - Event-driven serverless orders application.
+  API Gateway + Lambda + DynamoDB, with optional DAX and API Gateway stage cache.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# DAX and the API Gateway cache are NOT covered by the AWS free tier and bill
+# per hour, so they are switched off by default. Everything else in this
+# template is free-tier friendly. Flip the switches only when you want step 8.
+# ---------------------------------------------------------------------------
+Parameters:
+  EnableDax:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create a VPC, a DAX cluster and put the Lambda function in the VPC (billed per node-hour, no free tier).
+  EnableApiCache:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable the 0.5 GB API Gateway stage cache with a 300 s TTL (billed per hour, no free tier).
+  DaxNodeType:
+    Type: String
+    Default: dax.t3.small
+    AllowedValues: [dax.t3.small, dax.t3.medium]
+    Description: DAX node type (single node, development sizing).
+  LogRetentionInDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: CloudWatch Logs retention for the Lambda function.
+
+Conditions:
+  DaxEnabled: !Equals [!Ref EnableDax, 'true']
+  ApiCacheEnabled: !Equals [!Ref EnableApiCache, 'true']
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Timeout: 10
+    MemorySize: 256
+    Tracing: Active            # Step 4: AWS X-Ray active tracing on the Lambda function
+
+Resources:
+  # -------------------------------------------------------------------------
+  # Step 1 - DynamoDB table, on-demand capacity
+  # -------------------------------------------------------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+
+  # -------------------------------------------------------------------------
+  # Step 2 - Lambda function (POST /orders writes, GET .../items/{itemId} reads)
+  # Step 6 - esbuild bundling: minified, tree-shaken, AWS SDK v3 kept external
+  #          because the Node.js runtime already ships it.
+  # -------------------------------------------------------------------------
+  OrdersFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-orders'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  OrdersFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints: [index.js]
+        External: ['@aws-sdk/*']
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-orders'
+      Description: Creates orders (write) and reads order items (DAX when enabled).
+      CodeUri: src/
+      Handler: index.handler
+      LoggingConfig:
+        LogGroup: !Ref OrdersFunctionLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          # Step 8 - when set, reads go through DAX instead of DynamoDB
+          DAX_ENDPOINT: !If [DaxEnabled, !GetAtt DaxCluster.ClusterDiscoveryEndpointURL, !Ref AWS::NoValue]
+      VpcConfig: !If
+        - DaxEnabled
+        - SecurityGroupIds: [!Ref LambdaSecurityGroup]
+          SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - !Ref AWS::NoValue
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: WriteOrders
+              Effect: Allow
+              Action: [dynamodb:PutItem]            # TransactWriteItems is authorised per Put
+              Resource: !GetAtt OrdersTable.Arn
+            - Sid: ReadOrders
+              Effect: Allow
+              Action: [dynamodb:GetItem]            # also needed by DAX on cache misses
+              Resource: !GetAtt OrdersTable.Arn
+        - !If
+          - DaxEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadThroughDax
+                Effect: Allow
+                Action: [dax:GetItem]
+                Resource: !GetAtt DaxCluster.ClusterArn
+              - Sid: VpcNetworkInterfaces
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
+          - !Ref AWS::NoValue
+
+  OrdersFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrdersFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/*/*'
+
+  # -------------------------------------------------------------------------
+  # Step 7 - IAM role used by API Gateway to call DynamoDB directly (read only)
+  # -------------------------------------------------------------------------
+  ApiDynamoDbReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: apigateway.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource: !GetAtt OrdersTable.Arn
+
+  # -------------------------------------------------------------------------
+  # Step 3 - REST API  POST /orders            -> Lambda (proxy)
+  # Step 7 - REST API  GET  /orders/{orderId}  -> DynamoDB Query (no Lambda, VTL mapping)
+  # Step 8 - REST API  GET  /orders/{orderId}/items/{itemId} -> Lambda (reads via DAX)
+  #          Stage cache, TTL 300 s, when EnableApiCache=true
+  # -------------------------------------------------------------------------
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      StageName: prod
+      OpenApiVersion: '3.0.1'
+      EndpointConfiguration:
+        Type: REGIONAL
+      CacheClusterEnabled: !If [ApiCacheEnabled, true, false]
+      CacheClusterSize: '0.5'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 10        # cost / abuse protection
+          ThrottlingBurstLimit: 20
+          CachingEnabled: !If [ApiCacheEnabled, true, false]
+          CacheTtlInSeconds: 300         # only GET responses are cached
+          CacheDataEncrypted: true
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: orders-api
+          version: '1.0'
+        paths:
+          /orders:
+            post:
+              responses:
+                '201': {description: Order created}
+                '400': {description: Invalid order}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersFunction.Arn}/invocations'
+          /orders/{orderId}:
+            get:
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: Items of the order}
+                '400': {description: Bad request}
+                '502': {description: DynamoDB error}
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/Query'
+                credentials: !GetAtt ApiDynamoDbReadRole.Arn
+                passthroughBehavior: never
+                cacheNamespace: orders-by-id
+                cacheKeyParameters: [method.request.path.orderId]
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.0'"
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($orderId = $util.escapeJavaScript($input.params('orderId')).replaceAll("\\'","'"))
+                    {
+                      "TableName": "${OrdersTable}",
+                      "KeyConditionExpression": "orderId = :o",
+                      "ExpressionAttributeValues": {":o": {"S": "$orderId"}},
+                      "Limit": 50
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: |
+                        #set($root = $input.path('$'))
+                        #set($orderId = $util.escapeJavaScript($input.params('orderId')).replaceAll("\\'","'"))
+                        {
+                          "orderId": "$orderId",
+                          "count": $root.Count,
+                          "items": [
+                        #foreach($i in $root.Items)
+                        #set($itemId = $util.escapeJavaScript($i.itemId.S).replaceAll("\\'","'"))
+                        #set($customerId = $util.escapeJavaScript($i.customerId.S).replaceAll("\\'","'"))
+                            {
+                              "itemId": "$itemId",
+                              "quantity": $i.quantity.N,
+                              "price": $i.price.N,
+                              "customerId": "$customerId",
+                              "createdAt": "$i.createdAt.S"
+                            }#if($foreach.hasNext),#end
+                        #end
+                          ]
+                        }
+                  '4\d{2}':
+                    statusCode: '400'
+                    responseTemplates:
+                      application/json: '{"message":"Bad request"}'
+                  '5\d{2}':
+                    statusCode: '502'
+                    responseTemplates:
+                      application/json: '{"message":"Upstream error"}'
+          /orders/{orderId}/items/{itemId}:
+            get:
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema: {type: string}
+                - name: itemId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: Order item}
+                '404': {description: Not found}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersFunction.Arn}/invocations'
+                cacheNamespace: order-item
+                cacheKeyParameters:
+                  - method.request.path.orderId
+                  - method.request.path.itemId
+
+  # -------------------------------------------------------------------------
+  # Step 4 - CloudWatch dashboard
+  # -------------------------------------------------------------------------
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "API Gateway - Count", "region": "${AWS::Region}", "view": "timeSeries",
+                            "stat": "Sum", "period": 300,
+                            "metrics": [["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api"]]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "API Gateway - 4XXError", "region": "${AWS::Region}", "view": "timeSeries",
+                            "stat": "Sum", "period": 300,
+                            "metrics": [["AWS/ApiGateway", "4XXError", "ApiName", "${AWS::StackName}-api"]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "Lambda - Invocations", "region": "${AWS::Region}", "view": "timeSeries",
+                            "stat": "Sum", "period": 300,
+                            "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${OrdersFunction}"]]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "Lambda - Errors", "region": "${AWS::Region}", "view": "timeSeries",
+                            "stat": "Sum", "period": 300,
+                            "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${OrdersFunction}"]]}}
+          ]
+        }
+
+  # -------------------------------------------------------------------------
+  # Step 8 - DAX (only when EnableDax=true)
+  # DAX lives inside a VPC, so the Lambda function must too. No NAT gateway and
+  # no internet gateway are created (they cost money); the Lambda reaches
+  # DynamoDB through a free gateway VPC endpoint instead.
+  # -------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: DaxEnabled
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: DaxEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-a'}]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: DaxEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-b'}]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: DaxEnabled
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DaxEnabled
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DaxEnabled
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  DynamoDbGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: DaxEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DaxEnabled
+    Properties:
+      GroupDescription: Orders Lambda function (outbound only)
+      VpcId: !Ref Vpc
+
+  DaxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DaxEnabled
+    Properties:
+      GroupDescription: DAX cluster - TLS port from the Lambda function only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9111
+          ToPort: 9111
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  DaxSubnetGroup:
+    Type: AWS::DAX::SubnetGroup
+    Condition: DaxEnabled
+    Properties:
+      Description: Private subnets for the orders DAX cluster
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  DaxServiceRole:
+    Type: AWS::IAM::Role
+    Condition: DaxEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: dax.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DaxAccessToOrdersTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+
+  DaxCluster:
+    Type: AWS::DAX::Cluster
+    Condition: DaxEnabled
+    Properties:
+      ClusterName: orders-dax                 # DAX names are limited to 20 characters
+      Description: Read cache for the Orders table
+      NodeType: !Ref DaxNodeType
+      ReplicationFactor: 1                    # single node = cheapest; use 3 for production
+      IAMRoleARN: !GetAtt DaxServiceRole.Arn
+      SubnetGroupName: !Ref DaxSubnetGroup
+      SecurityGroupIds: [!Ref DaxSecurityGroup]
+      ClusterEndpointEncryptionType: TLS
+      SSESpecification:
+        SSEEnabled: true
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the REST API (stage prod)
+    Value: !Sub 'https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  FunctionName:
+    Value: !Ref OrdersFunction
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard'
+  DaxEndpoint:
+    Condition: DaxEnabled
+    Value: !GetAtt DaxCluster.ClusterDiscoveryEndpointURL

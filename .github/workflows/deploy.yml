@@ -1,0 +1,73 @@
+name: Deploy SAM application
+
+# Step 5 - runs on every push to main (and can be started by hand).
+# Required repository secrets : AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+# Optional repository variables: ENABLE_DAX, ENABLE_API_CACHE  ("true" / "false", default "false")
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never run two deployments of the same stack at once.
+concurrency:
+  group: deploy-orders-app
+  cancel-in-progress: false
+
+env:
+  STACK_NAME: orders-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # a DAX cluster alone can take ~20 minutes to create
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install function dependencies (esbuild + DAX client)
+        working-directory: src
+        run: npm install --no-audit --no-fund
+
+      - name: Validate template
+        run: sam validate --lint
+
+      - name: Build (esbuild bundle of the Lambda code)
+        run: sam build
+
+      - name: Deploy (packages the code, uploads it to S3 and updates the stack and the function)
+        run: |
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --region "${{ secrets.AWS_REGION }}" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              EnableDax=${{ vars.ENABLE_DAX || 'false' }} \
+              EnableApiCache=${{ vars.ENABLE_API_CACHE || 'false' }}
+
+      - name: Show stack outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table

@@ -1,0 +1,14 @@
+{
+  "name": "orders-function",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Orders Lambda function (project 4 - event driven application)",
+  "main": "index.js",
+  "dependencies": {
+    "amazon-dax-client": "^1.2.0",
+    "aws-sdk": "^2.1000.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
