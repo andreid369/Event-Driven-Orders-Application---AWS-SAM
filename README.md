@@ -1,230 +1,298 @@
-# Project 4 – Event-Driven Orders Application (AWS SAM)
+# Project 4 – Event-Driven Orders Application (AWS SAM, multi-Region)
 
-A serverless orders backend built with the AWS Serverless Application Model (SAM), deployed from your machine
-and automatically from GitHub Actions on every push to `main`.
+Orders come in through API Gateway, are queued in SQS, processed idempotently by Lambda, announced as events on
+Amazon EventBridge (through a **global endpoint**), fanned out to a fulfilment queue and an SNS topic, and the whole
+application runs in **two AWS Regions**. It is deployed from your computer or, on every push to `main`, from GitHub Actions.
+
+> **Status – read this first.** The template, workflow and Lambda code were checked offline only: the YAML parses and
+> every reference resolves, the JavaScript passes a syntax check, and the idempotency / concurrency / batch-failure logic
+> passes an in-memory test. **Nothing has been deployed to a real AWS account** (the SAM CLI, cfn-lint and npm were not
+> reachable from the build environment). Expect to fix a small thing or two on the first real deployment; §7 lists the
+> parts I am least sure about.
 
 ---
 
-## 1. Project scope
+## 1. Project scope and AWS services
 
-| What | Detail |
+### 1.1 What it does
+
+```mermaid
+flowchart LR
+  C([Client]) -- "POST /orders" --> APIGW["API Gateway<br/>validates body, answers 202"]
+  APIGW -- SendMessage --> OQ[("SQS orders queue")]
+  OQ -. "3 failed receives" .-> DLQ[("Dead-letter queue")]
+  OQ --> CO["Lambda CreateOrder<br/>idempotent on orderId"]
+  CO <--> OT[("DynamoDB Orders")]
+  CO -- "PutEvents OrderCreated" --> GE{{"EventBridge<br/>global endpoint"}}
+  GE --> PB["Event bus (primary Region)"]
+  GE -. "failover + replication" .-> SB["Event bus (secondary Region)"]
+  PB -- rule --> FQ[("SQS fulfilment queue")] --> FO["Lambda FulfilOrder"] --> FT[("DynamoDB Fulfilment")]
+  PB -- rule --> SNS["SNS order notifications"]
+```
+
+The diagram shows one Region. The **same stack is deployed in both Regions**, so each Region has its own API Gateway,
+Lambda functions, event bus, SQS queues, SNS topic, DynamoDB tables and dashboard.
+
+| Item | Detail |
 |---|---|
-| **Goal** | Receive orders over HTTPS, store them in DynamoDB, read them back fast, and observe everything on a dashboard. |
-| **Write path** | `POST /orders` → API Gateway → Lambda → DynamoDB (`Orders` table, one row per order item, written atomically). |
-| **Read path 1** | `GET /orders/{orderId}` → API Gateway → **DynamoDB directly** (no Lambda; request/response VTL mapping templates). |
-| **Read path 2** | `GET /orders/{orderId}/items/{itemId}` → API Gateway → Lambda → **DAX** (falls back to plain DynamoDB when DAX is off). |
-| **Performance** | API Gateway stage cache (TTL 300 s) on the GET methods; DAX in front of DynamoDB for Lambda reads. |
-| **Observability** | CloudWatch dashboard (API Count, 4XXError, Lambda Invocations, Errors) + X-Ray active tracing on the Lambda. |
-| **Delivery** | GitHub Actions: validate → build → deploy on every push to `main`, using AWS credentials stored as repository secrets. |
+| **Write path** | `POST /orders` → API Gateway validates the JSON → message on SQS → API answers **202 Accepted** immediately (it does not wait for Lambda). |
+| **Idempotency** | The client sends a unique `orderId`. CreateOrder claims it with a DynamoDB conditional write; duplicates return the stored result and trigger no second event. |
+| **Events** | After the order is stored, CreateOrder publishes `OrderCreated` through the EventBridge global endpoint. |
+| **Fan-out** | Rule 1 → SQS → **FulfilOrder** Lambda → *Fulfilment* table. Rule 2 → **SNS** topic (optional e-mail subscription). |
+| **Failure handling** | Source queue has a dead-letter queue: after **3** failed receives a message is moved there. The fulfilment queue has one too. |
+| **Read path** | `GET /orders/{orderId}` → Lambda → order status + fulfilment record (the client polls this after the 202). |
+| **Observability** | CloudWatch dashboard: EventBridge `MatchedEvents`, SQS `NumberOfMessagesSent`, SNS `NumberOfMessagesPublished` (+ DLQ depth); X-Ray tracing on Lambda. |
+| **Disaster recovery** | EventBridge **global endpoint** + Route 53 health check: if ingestion in the primary Region degrades, publishers are routed to the secondary Region. Replication keeps both buses in step. |
+| **Delivery** | GitHub Actions on every push to `main`, credentials from repository secrets. |
 
-> **Assumption to confirm:** your step 8 says "configure the existing Lambda to use DAX for read operations", but the Lambda
-> from step 2 only writes. I therefore gave the *same* Lambda a read route (`GET /orders/{orderId}/items/{itemId}`) that
-> uses DAX. Step 7's direct DynamoDB integration (`GET /orders/{orderId}`) bypasses Lambda, so it cannot use DAX.
+### 1.2 Where each requirement lives
 
-### AWS services used (short résumé)
-
-| Service | Role in this project | Free-tier position (see §2) |
+| # | Requirement | Implemented in |
 |---|---|---|
-| **AWS SAM / CloudFormation** | Defines and deploys the whole stack from `template.yaml`. | Free (you pay for what it creates). |
-| **Amazon DynamoDB** | `Orders` table, partition key `orderId`, sort key `itemId`, on-demand capacity. | Storage free up to 25 GB; **on-demand requests have no free tier** (pennies at lab volume). |
-| **AWS Lambda** (Node.js 22, arm64) | Creates orders; reads items (DAX). | Always-free monthly allowance. |
-| **Amazon API Gateway** (REST) | Public API, direct DynamoDB integration, stage cache. | Free-tier eligible; **the stage cache is billed hourly, no free tier**. |
-| **Amazon CloudWatch** | Dashboard, Lambda logs (7-day retention), metrics. | Small free allowance. |
-| **AWS X-Ray** | Active tracing on the Lambda. | Small free monthly allowance. |
-| **Amazon DAX** | In-memory read cache for DynamoDB. | **No free tier – billed per node-hour.** |
-| **Amazon VPC** (+ DynamoDB gateway endpoint) | Needed only because DAX lives in a VPC. No NAT gateway, no internet gateway. | Free as built here. |
-| **IAM** | Least-privilege roles for Lambda, API Gateway → DynamoDB, DAX → DynamoDB. | Free. |
-| **Amazon S3** | SAM stores the packaged Lambda code (managed bucket). | Pennies. |
+| 1 | Custom bus + `OrderCreated` event from CreateOrder | `OrderBus`, `src/create-order/index.js` (`publishOrderCreated`) |
+| 2 | SQS queue + rule + `FulfilOrder` + new DynamoDB table | `FulfilmentQueue`, `OrderToFulfilmentRule`, `FulfilOrderFunction`, `FulfilmentTable` |
+| 3 | SNS topic + rule | `OrderNotificationsTopic`, `OrderNotificationRule` (input transformer builds the message) |
+| 4 | CloudWatch dashboard | `OrdersDashboard` |
+| 5 | GitHub Actions deployment | `.github/workflows/deploy.yml` |
+| 6 | API Gateway → SQS → CreateOrder (async, validated) | `OrdersApi` (JSON-schema model + direct SQS integration), `OrdersQueue`, event source of `CreateOrderFunction` |
+| 7 | DLQ, redrive after 3 attempts | `OrdersDeadLetterQueue` + `RedrivePolicy.maxReceiveCount: 3` on `OrdersQueue` |
+| 8 | Idempotent processing, no race conditions | `processOrder()` in `src/create-order/index.js` (conditional `PutItem` + lease takeover) |
+| 9 | Active-active multi-Region with global endpoints | `RegionRole` parameter, `GlobalEndpoint`, `EndpointHealthCheck`, `EndpointHighLatencyAlarm`, `EndpointReplicationRole`; `EndpointId` passed to `PutEvents` |
+
+### 1.3 AWS services used (short résumé)
+
+| Service | Role |
+|---|---|
+| **AWS SAM / CloudFormation** | Defines and deploys everything from `template.yaml` (one stack per Region). |
+| **Amazon API Gateway (REST)** | Public API; validates requests; writes straight to SQS (no Lambda in the write path). |
+| **Amazon SQS** | Orders queue, fulfilment queue, and a dead-letter queue for each. |
+| **AWS Lambda (Node.js 22)** | `CreateOrder`, `FulfilOrder`, `GetOrder`. |
+| **Amazon DynamoDB** | `orders` table (idempotency + state) and `fulfilment` table. |
+| **Amazon EventBridge** | Custom event bus, rules, and the **global endpoint** (with event replication). |
+| **Amazon SNS** | Order notification topic (optional e-mail subscriber). |
+| **Amazon CloudWatch** | Dashboard, logs (7-day retention), the failover alarm. |
+| **Amazon Route 53** | One *health check* (type CloudWatch metric) that tells the global endpoint when to fail over. No hosted zone, no domain. |
+| **AWS IAM** | Least-privilege roles (Lambda, API Gateway → SQS, endpoint replication). |
+| **AWS X-Ray** | Active tracing on the functions. |
+| **Amazon S3** | SAM's managed artifact bucket (one per Region) holding the packaged code. |
 
 ---
 
-## 2. AWS free tier – what you need to know
+## 2. Free tier: restrictions you will run into
 
-**Rule of this template:** everything runs on free-tier-friendly services **except** DAX and the API Gateway stage cache.
-Those two are controlled by parameters that default to `false`, so the default deployment (steps 1-7) costs about nothing.
+Short version: **the application is cheap, but it is not 100 % free.** Costs come from EventBridge custom events, and
+the multi-Region design multiplies usage. At lab volume (hundreds of orders) expect cents, not dollars.
 
-| Restriction / cost | What happens | How the template handles it |
+What I **verified on the AWS pricing pages**:
+
+- **EventBridge custom events: $1.00 per million, no free tier.** Publishing to the global endpoint is a custom event. There is *no extra charge for the global endpoint itself*, but delivery to another event bus is also $1.00 per million, and cross-Region transfer can add data-transfer charges. With replication on, every order is billed roughly twice.
+- **Route 53 health check: $0.50 per month** for a CloudWatch-metric health check (billed like an AWS-endpoint check). The same page also says up to 50 AWS-endpoint health checks per account are free, so it may cost nothing; check your bill.
+
+What I am stating from general knowledge (**confirm on the AWS Free Tier page**):
+
+| Service | Free allowance (typical) | Effect here |
 |---|---|---|
-| **DAX has no free tier** | Billed per node-hour (a `dax.t3.small` was about $0.04/hour in US East when I checked, roughly $29/month if left running), and it is not serverless. | `EnableDax=false` by default; single node; tear-down chapter removes it. |
-| **API Gateway stage cache has no free tier** | The smallest cache (0.5 GB) bills hourly while it exists (from my memory of AWS pricing, about $0.02/hour – check the pricing page). | `EnableApiCache=false` by default. |
-| **DynamoDB on-demand** | The always-free 25 RCU/WCU applies to *provisioned* tables only. On-demand requests are billed per request. | You asked for on-demand, so it is kept; at lab volume this is cents. Storage (25 GB) stays free. |
-| **DAX forces a VPC** | The Lambda must run inside a VPC. A NAT gateway would cost money, so none is created; the Lambda reaches DynamoDB over a free gateway endpoint. | Built into the `EnableDax` condition. |
-| **DAX build time** | Creating the cluster takes roughly 15-25 minutes. | Workflow timeout is 45 min. |
-| **API cache staleness** | A new order may not show on cached GETs for up to 300 s. | Expected behaviour of the requirement. |
+| Lambda | 1 M requests + 400 000 GB-s / month, always free | Fine. |
+| SQS | 1 M requests / month, always free | Fine; EventBridge→SQS deliveries count too. |
+| SNS | 1 M publishes, 1 000 e-mail deliveries / month | Fine. |
+| DynamoDB | 25 GB + 25 provisioned RCU / 25 WCU | Tables use **provisioned 5/5** (4 tables = 20/20), because *on-demand has no free tier*. Tiny capacity: bursts are throttled and retried through SQS. |
+| API Gateway (REST) | 1 M calls / month for the first 12 months (older accounts) | Stage throttled to 10 req/s as a safety net. |
+| CloudWatch | 10 alarms, 3 dashboards, basic metrics, 5 GB logs | 1 alarm + 1 dashboard per Region. |
+| X-Ray | 100 000 traces / month | Fine. |
 
-**Which AWS plan is your account on?** (Billing console → *Account plan*)
+Restrictions and traps specific to this project:
 
-- **Accounts created on/after 15 July 2025** choose a *Free plan* (credit based, up to $200, ends after 6 months or when credits run out) or a *Paid plan*.
-  On the Free plan, AWS describes services such as API Gateway as "Free Tier eligible", meaning usage is deducted from your credits, and some services are restricted.
-  Enabling a service the Free plan does not allow can require upgrading to the Paid plan. I could **not** confirm whether DAX or the API cache are on the Free plan's allowed list, so
-  check the *AWS Free Tier* page. If stack creation fails on `EnableDax=true` or `EnableApiCache=true` with a plan/permission message, that is the cause.
-  Upgrading keeps your remaining credits, but charges continue after they run out.
-- **Accounts created before that date** are on the legacy Free Tier (always-free services plus 12-month offers, which have probably expired).
-
-Set a **budget alert** before you start: Billing → *Budgets* → *Create budget* → *Zero spend budget* (or $5).
+1. **Two Regions = double work.** With replication, *both* Regions process every order (two Lambda runs, two fulfilment rows, two notifications). Usage allowances are per account, not per Region, so they are shared.
+2. **Duplicate e-mails.** Both Regions' SNS topics publish each order. Subscribe `NotificationEmail` in one Region only, or accept two mails.
+3. **Low Lambda concurrency on new accounts** (often 10 in total). `QueueConsumerConcurrency` defaults to **2** so throttled pollers do not drive messages to the DLQ. Check *Service Quotas → Lambda → Concurrent executions*.
+4. **Account plan.** Accounts created since mid-July 2025 can be on the credit-based *Free plan*, where some services/features may be restricted until you upgrade. I could not confirm whether EventBridge global endpoints or Route 53 health checks are on its allowed list. If stack creation fails with a plan/permission message, that is the cause (Billing → *Account plan*).
+5. **Region support.** Check that your two Regions support global endpoints (defaults `eu-central-1` / `eu-west-1`). The two Regions must be different, and the bus must have the **same name** in both.
+6. **True active-active routing is not free.** Sending *client traffic* to both Regions needs Route 53 records (a domain, hosted zone, latency/weighted routing). This project gives you two independent regional API URLs; see §7.
+7. **Set a budget alert first:** Billing → *Budgets* → *Zero-spend budget*.
 
 ---
 
 ## 3. Prerequisites
 
-- An AWS account and an IAM user for deployments (dedicated user, access keys; AdministratorAccess is simplest for a lab).
-- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and
-  [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- Node.js 22 and npm
-- Git and a GitHub account
+- An AWS account and an IAM user for deployments (access keys; `AdministratorAccess` is simplest for a lab).
+- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), Node.js 22, Git, a GitHub account.
+- **Windows users (PowerShell):** the commands below are single-line so they work in PowerShell, cmd and bash. Use `curl.exe` (not the `curl` alias). Build with Docker: `sam build --use-container` (needs Docker Desktop), because the CreateOrder function includes a native library (AWS CRT) that must be built for Linux. Deploying through GitHub Actions (§5) avoids this entirely.
 
 Project layout:
 
 ```
 .
-├── template.yaml                    # all AWS resources (steps 1-4, 7, 8)
-├── samconfig.toml                   # default stack name / region for sam deploy
+├── template.yaml                  # all AWS resources (steps 1-4, 6-9)
+├── samconfig.toml                 # stack name, Regions, defaults for sam deploy
+├── events/order.json              # sample request body (+ invalid-order.json for the 400 test)
 ├── src/
-│   ├── index.js                     # Lambda function (step 2, optimised in step 6)
-│   └── package.json                 # esbuild (dev) + DAX client
-├── .github/workflows/deploy.yml     # CI/CD (step 5)
+│   ├── create-order/              # CreateOrder (idempotent, publishes via global endpoint) + package.json (CRT)
+│   ├── fulfil-order/              # FulfilOrder (SQS consumer)
+│   └── get-order/                 # GET /orders/{orderId}
+├── .github/workflows/deploy.yml   # CI/CD (step 5)
 └── README.md
 ```
-
-| Step | Where it lives in the template |
-|---|---|
-| 1 DynamoDB `Orders` table | `OrdersTable` |
-| 2 Lambda + IAM | `OrdersFunction` (inline least-privilege policies) |
-| 3 REST API `POST /orders` | `OrdersApi` → `paths./orders.post` |
-| 4 Dashboard + X-Ray | `OrdersDashboard`, `Globals.Function.Tracing: Active` |
-| 5 GitHub Actions | `.github/workflows/deploy.yml` |
-| 6 Optimisation | `OrdersFunction.Metadata` (esbuild), clients created outside the handler in `src/index.js` |
-| 7 API → DynamoDB without Lambda | `ApiDynamoDbReadRole`, `paths./orders/{orderId}.get` (VTL templates) |
-| 8 DAX + API cache | `DaxCluster` & VPC resources (`EnableDax`), `CacheClusterEnabled` / `MethodSettings` (`EnableApiCache`) |
 
 ---
 
 ## 4. Deploy procedure – AWS (from your computer)
 
+Region names below are the defaults (`eu-central-1` = **primary**, `eu-west-1` = **secondary**); change them in
+`samconfig.toml` if you like.
+
 ### Step 4.1 – Configure the AWS CLI
 
-```bash
-aws configure                      # access key, secret key, region (e.g. eu-central-1), output json
-aws sts get-caller-identity        # confirm which account you are using
+```
+aws configure
+aws sts get-caller-identity
 ```
 
-### Step 4.2 – Install esbuild
+Enter the access key, secret key, default region `eu-central-1`, output `json`. The second command shows which account you are about to use.
 
-`sam build` bundles the function with esbuild, which must be available on your `PATH`
-(SAM installs the function's own dependencies, such as the DAX client, by itself):
+### Step 4.2 – Validate and build
 
-```bash
-npm install -g esbuild
-esbuild --version
 ```
-
-### Step 4.3 – Validate and build
-
-```bash
 sam validate --lint
-sam build
+sam build --use-container
 ```
 
-`sam build` bundles `src/index.js` with esbuild (minified, SDK v3 left out because the Lambda runtime provides it).
-Check the result size: `du -sh .aws-sam/build/OrdersFunction`.
+(`sam build` without `--use-container` is fine on Linux x86_64.) `sam build` runs `npm install` for each function.
 
-### Step 4.4 – Deploy the free-tier-friendly stack (steps 1-7)
+### Step 4.3 – Deploy the primary Region only (single-Region mode, steps 1-8)
 
-```bash
-sam deploy --guided
+This is the safest first run: no global endpoint, no Route 53, events go to the local bus.
+
+```
+sam deploy
 ```
 
-Answer: stack name `orders-app`, your region, *confirm changes* **Y**, *allow IAM role creation* **Y**,
-*save arguments to samconfig.toml* **Y**. Leave `EnableDax` and `EnableApiCache` at `false`.
+Accept the defaults (stack `orders-app`, IAM role creation **Y**). Add an e-mail for notifications with
+`sam deploy --parameter-overrides "RegionRole=primary EnableGlobalEndpoint=false NotificationEmail=you@example.com"`,
+then click the confirmation link AWS mails you. Skip to §4.5 to test; come back here for the multi-Region upgrade.
 
-When it finishes, read the outputs:
+### Step 4.4 – Go multi-Region (step 9): secondary → primary → secondary
 
-```bash
-aws cloudformation describe-stacks --stack-name orders-app \
-  --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table
-export API_URL="<ApiUrl output>"
+The global endpoint needs the event bus of **both** Regions, and the secondary Lambdas need the endpoint id, so the
+order is fixed.
+
+**1) Secondary Region first** (creates its bus, queues, API, …):
+
 ```
+sam deploy --config-env secondary
+```
+
+**2) Primary Region, now with the global endpoint** (creates the CloudWatch alarm, Route 53 health check, replication role and the endpoint):
+
+```
+sam deploy --parameter-overrides "RegionRole=primary PeerRegion=eu-west-1 EnableGlobalEndpoint=true"
+```
+
+Read the endpoint id:
+
+```
+aws cloudformation describe-stacks --stack-name orders-app --region eu-central-1 --query "Stacks[0].Outputs[?OutputKey=='GlobalEndpointId'].OutputValue" --output text
+```
+
+(The primary CreateOrder already uses it – the id is wired in with `!GetAtt`.)
+
+**3) Secondary Region again**, so its Lambda publishes through the endpoint too (replace `<id>`):
+
+```
+sam deploy --config-env secondary --parameter-overrides "RegionRole=secondary PeerRegion=eu-central-1 GlobalEndpointId=<id>"
+```
+
+Until step 3 is done the secondary publishes to its own local bus – nothing breaks, it just is not using the endpoint yet.
 
 ### Step 4.5 – Test
 
-```bash
-# create an order (Lambda -> DynamoDB)
-curl -s -X POST "$API_URL/orders" -H 'Content-Type: application/json' \
-  -d '{"customerId":"c-100","items":[{"itemId":"sku-1","quantity":2,"price":9.99},{"itemId":"sku-2","quantity":1,"price":24.5}]}'
-# -> {"orderId":"<uuid>","itemCount":2,"createdAt":"..."}
+Get the API URL (repeat with `--region eu-west-1` for the secondary Region):
 
-export ORDER_ID="<orderId from above>"
-
-# read all items of the order (API Gateway -> DynamoDB directly, no Lambda)
-curl -s "$API_URL/orders/$ORDER_ID"
-
-# read one item (Lambda; DAX when enabled)
-curl -s "$API_URL/orders/$ORDER_ID/items/sku-1"
+```
+aws cloudformation describe-stacks --stack-name orders-app --region eu-central-1 --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text
 ```
 
-Then open the **DashboardUrl** output (CloudWatch → Dashboards) and *Lambda → Monitor → Traces* for X-Ray.
-Direct integration check: the Lambda **Invocations** widget must not increase when you call `GET /orders/{orderId}`.
+**a) Create an order** – answers immediately with `202 Accepted`:
 
-### Step 4.6 – (Optional, costs money) Enable DAX and the API cache – step 8
-
-Read §2 first. Then:
-
-```bash
-sam deploy --parameter-overrides EnableDax=true EnableApiCache=true
+```
+curl.exe -i -X POST "<ApiUrl>/orders" -H "Content-Type: application/json" --data "@events/order.json"
 ```
 
-DAX takes roughly 15-25 minutes to create. Afterwards:
+**b) Check the result** (after a few seconds):
 
-```bash
-curl -s "$API_URL/orders/$ORDER_ID/items/sku-1"     # response contains "source":"dax"
+```
+curl.exe "<ApiUrl>/orders/ord-1001-demo"
 ```
 
-Cache check: call the same GET twice within 300 s; the second call is served from the stage cache (check `CacheHitCount` /
-`CacheMissCount` for the API in CloudWatch). **Switch both back to `false` (see §6) as soon as you finish testing.**
+You should see `"status":"COMPLETED"` and a `fulfilment` object with `"status":"FULFILLED"`.
+
+**c) Validation** – a body without `customerId` must return `400` and never reach SQS:
+
+```
+curl.exe -i -X POST "<ApiUrl>/orders" -H "Content-Type: application/json" --data "@events/invalid-order.json"
+```
+
+**d) Idempotency** – send the **same** `events/order.json` three more times (each answers 202). Then confirm there is still exactly one order, one fulfilment row and one notification:
+
+```
+aws dynamodb scan --table-name orders-app-fulfilment --select COUNT --region eu-central-1
+```
+
+(Change `orderId` in the file to create a different order.)
+
+**e) Dead-letter queue** – put a poison message directly on the queue and watch it move after 3 failed receives (about 3–4 minutes, the visibility timeout is 60 s):
+
+```
+aws sqs send-message --queue-url <OrdersQueueUrl output> --message-body "not json" --region eu-central-1
+aws sqs get-queue-attributes --queue-url <OrdersDeadLetterQueueUrl output> --attribute-names ApproximateNumberOfMessages --region eu-central-1
+```
+
+**f) Multi-Region** – post an order to the **secondary** API URL. Because the event goes through the global endpoint and is replicated, the order record is in the secondary Region's `orders` table, and a fulfilment row appears in **both** Regions' `orders-app-fulfilment` tables.
+
+**g) Dashboard** – open the `DashboardUrl` output (CloudWatch → Dashboards): MatchedEvents, NumberOfMessagesSent, NumberOfMessagesPublished. Metrics appear after a few minutes.
 
 ---
 
-## 5. Deploy procedure – GitHub (automatic deployment on every push to `main`)
+## 5. Deploy procedure – GitHub (automatic on every push to `main`)
 
 ### Step 5.1 – Create the repository and push
 
-```bash
+```
 git init -b main
 git add .
-git commit -m "Initial commit: orders SAM application"
+git commit -m "Orders event-driven application"
 git remote add origin https://github.com/<your-user>/<your-repo>.git
 git push -u origin main
 ```
 
-(Do not commit AWS keys. The `.gitignore` already excludes `.aws-sam/` and `node_modules/`.)
+Never commit AWS keys (`.gitignore` already excludes `.aws-sam/` and `node_modules/`).
 
 ### Step 5.2 – Create deployment credentials in AWS
 
-IAM → Users → *Create user* `github-sam-deployer` → attach a policy (AdministratorAccess for a lab; tighten later) →
-*Security credentials* → *Create access key* (use case: *Application running outside AWS*).
+IAM → Users → *Create user* `github-sam-deployer` → attach `AdministratorAccess` (lab; tighten later) → *Security credentials* → *Create access key* (use case: *Application running outside AWS*).
 
 ### Step 5.3 – Store them as GitHub repository secrets
 
-Repository → *Settings → Secrets and variables → Actions → Secrets → New repository secret*:
+Repository → *Settings → Secrets and variables → Actions*:
 
-| Secret | Value |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | access key id |
-| `AWS_SECRET_ACCESS_KEY` | secret access key |
-| `AWS_REGION` | e.g. `eu-central-1` (same region as your first deployment) |
-
-Optional *Variables* tab (not secrets): `ENABLE_DAX` and `ENABLE_API_CACHE`, `true` or `false`. If unset they default to `false`.
+| Type | Name | Value |
+|---|---|---|
+| **Secret** | `AWS_ACCESS_KEY_ID` | access key id |
+| **Secret** | `AWS_SECRET_ACCESS_KEY` | secret access key |
+| Variable (optional) | `PRIMARY_REGION` | default `eu-central-1` |
+| Variable (optional) | `SECONDARY_REGION` | default `eu-west-1` |
+| Variable (optional) | `MULTI_REGION` | `true` (default) or `false` = single Region, steps 1-8 only |
+| Variable (optional) | `NOTIFICATION_EMAIL` | address for the SNS subscription |
 
 ### Step 5.4 – What the workflow does
 
-`.github/workflows/deploy.yml` runs on every push to `main` (and manually via *Actions → Run workflow*):
+`.github/workflows/deploy.yml` runs on every push to `main` (and manually: *Actions → Run workflow*):
 
-1. check out → set up Node 22 and SAM CLI → configure AWS credentials from the secrets
-2. `npm install -g esbuild` → `sam validate --lint` → `sam build` (esbuild)
-3. `sam deploy` – uploads the package to S3 and updates the CloudFormation stack **and** the Lambda function code
-4. prints the stack outputs
+1. check out, set up Node 22 and SAM CLI, load the AWS credentials from the secrets
+2. `sam validate --lint`, then `sam build` (packages every function with its npm dependencies)
+3. `sam deploy` **secondary → primary → secondary (again, only if the endpoint id changed)** – the same order as §4.4
+4. prints the outputs of both stacks
 
-Push a change and watch *Actions*. A deployment with no changes ends successfully (`--no-fail-on-empty-changeset`).
+Pushing a change to a Lambda file re-packages and updates that function; pushing a template change updates the stacks. An unchanged push ends green (`--no-fail-on-empty-changeset`). The first run takes a few minutes longer (endpoint creation).
 
 > Hardening for later: replace long-lived access keys with GitHub OIDC and an IAM role; pin actions to commit SHAs.
 
@@ -232,58 +300,55 @@ Push a change and watch *Actions*. A deployment with no changes ends successfull
 
 ## 6. Tear down and stop all costs (keep the configuration)
 
-Your **configuration is the code**: `template.yaml`, `src/`, `samconfig.toml`, the workflow and the GitHub secrets. None of the options below touch them, so you can redeploy at any time.
+Your **configuration is code** and stays untouched by everything below: `template.yaml`, `src/`, `samconfig.toml`, the workflow, and the GitHub secrets/variables. Redeploying later recreates the whole thing.
 
-### Option A – Stop only the paid parts (stack and data stay)
+### 6.1 What can cost money while idle
 
-Removes DAX, the VPC pieces and the API cache; the table, Lambda, API and dashboard remain (all free or cents).
+An idle stack has almost no cost (queues, SNS, event buses, Lambda are pay-per-use). The only standing items are the Route 53 health check (about $0.50/month, possibly inside its free allowance), the DynamoDB provisioned capacity (inside the free 25/25 units), CloudWatch logs/dashboard (tiny) and S3 storage of the packaged code (cents). There is no "pause" button, so for a **guaranteed $0**, delete the stacks.
 
-```bash
-sam deploy --parameter-overrides EnableDax=false EnableApiCache=false
-```
+### 6.2 Delete everything in AWS
 
-Or set the GitHub variables `ENABLE_DAX` / `ENABLE_API_CACHE` to `false` and re-run the workflow.
-
-### Option B – Delete everything in AWS (nothing left that can bill)
-
-1. **Pause automatic deployments** so a push does not recreate the stack:
-   `gh workflow disable deploy.yml` (or *Actions → Deploy SAM application → ⋯ → Disable workflow*).
-2. **(Optional) back up the data** – the table is deleted with the stack:
-   `aws dynamodb scan --table-name Orders --output json > orders-backup.json`
-3. **Delete the stack** (API, Lambda, table, log group, dashboard, DAX, VPC – all of it):
-   ```bash
-   sam delete --stack-name orders-app --region <your-region>
+1. **Stop automatic deployments**, so a push cannot recreate the stacks: *Actions → Deploy SAM application → ⋯ → Disable workflow* (or `gh workflow disable deploy.yml`).
+2. **(Optional) back up the data** (the tables are deleted with the stacks):
    ```
-   Answer *yes* to also delete the uploaded code in S3.
-4. **Remove the SAM artifact bucket** if no other SAM project uses it: S3 console → bucket starting with
-   `aws-sam-cli-managed-default-samclisourcebucket-` → *Empty* (versioned bucket, so empty it in the console) → then CloudFormation →
-   delete the stack `aws-sam-cli-managed-default`.
-5. **Neutralise the credentials but keep them on file:** IAM → user `github-sam-deployer` → access key → *Make inactive*.
-   (Delete the key if you will not come back; the GitHub secrets can stay as they are.)
-6. **Confirm nothing is running:**
-   ```bash
-   aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
-     --query "StackSummaries[].StackName"
-   aws dax describe-clusters --query "Clusters[].ClusterName"          # must be empty
-   aws logs describe-log-groups --log-group-name-prefix /aws/lambda/orders-app
+   aws dynamodb scan --table-name orders-app-orders --region eu-central-1 --output json > orders-backup.json
+   aws dynamodb scan --table-name orders-app-fulfilment --region eu-central-1 --output json > fulfilment-backup.json
    ```
-   Also look at Billing → *Bills* and *Free Tier usage* the next day; DAX and cache usage is what you want to see stop.
+3. **Delete the primary stack first** (this removes the global endpoint, Route 53 health check and alarm), **then the secondary**:
+   ```
+   sam delete --stack-name orders-app --region eu-central-1
+   sam delete --stack-name orders-app --region eu-west-1
+   ```
+   Answer *yes* to also delete the uploaded code in S3. If a delete ends in `DELETE_FAILED`, open CloudFormation → the stack → *Events*, fix what it names (usually a leftover manual resource), and delete again.
+4. **Remove SAM's artifact buckets** if no other SAM project uses them (one per Region): S3 → bucket starting with `aws-sam-cli-managed-default-samclisourcebucket-` → *Empty* → then CloudFormation → delete the stack `aws-sam-cli-managed-default` in that Region.
+5. **Neutralise the credentials but keep them on file:** IAM → user `github-sam-deployer` → access key → *Make inactive*. (The GitHub secrets can stay as they are.)
+6. **Confirm nothing is left** (repeat for both Regions):
+   ```
+   aws cloudformation list-stacks --region eu-central-1 --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --query "StackSummaries[].StackName"
+   aws events list-endpoints --region eu-central-1
+   aws sqs list-queues --region eu-central-1
+   aws dynamodb list-tables --region eu-central-1
+   aws logs describe-log-groups --log-group-name-prefix /aws/lambda/orders-app --region eu-central-1
+   ```
+   Also look at Billing → *Bills* and *Free Tier usage* the next day. Route 53 → *Health checks* must be empty.
 
-### Redeploy later
+### 6.3 Redeploy later
 
-```bash
-sam build && sam deploy            # or re-enable the workflow and push / run it manually
-```
-
-Re-activate the IAM access key first if you made it inactive. Stack name, region and parameters are remembered in `samconfig.toml` and the GitHub secrets/variables.
+Re-activate the IAM access key, re-enable the workflow, then push or run it manually – or deploy by hand with §4.4. Stack names, Regions and parameters come from `samconfig.toml`, the workflow and the GitHub variables.
 
 ---
 
-## 7. Notes and known limits
+## 7. Design notes and known limits
 
-- **Not run end-to-end.** The template, workflow and function were validated for structure and logic offline, but they have not been deployed. In particular the DAX client package (`amazon-dax-client`, built on AWS SDK v2) and its endpoint format were not verified against a live cluster. If the first `EnableDax=true` run fails, check the Lambda logs first.
-- **Bundle size.** The DAX client pulls in AWS SDK v2, which makes the bundle noticeably larger than a plain SDK v3 function. It is only loaded at cold start when `DAX_ENDPOINT` is set. Measure with `du -sh .aws-sam/build/OrdersFunction`.
-- DynamoDB table name is fixed to `Orders` (as requested); a second copy of the stack in the same region would clash. The DAX cluster name `orders-dax` is fixed for the same reason.
-- DAX is configured with one node for cost. Use three nodes across Availability Zones for production.
-- Writes always go straight to DynamoDB; DAX serves reads only.
-- Only `GET` responses are cached by API Gateway (300 s TTL). Cache keys are the path parameters, so each order/item is cached separately.
+- **Not run end-to-end** (see the status note at the top). Parts I could not verify against a live account:
+  - **Native CRT library.** `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). I expect the npm package to ship Linux prebuilt binaries, and the Lambda is set to `x86_64` to match the GitHub runner, but I could not install it here. If CreateOrder fails at cold start with a CRT / `signature-v4-crt` error, that is the place to look (build with `sam build --use-container`).
+  - **Replication role permissions** (`events:PutEvents` on both buses, trust `events.amazonaws.com`) are my reading of the docs, which did not list the policy. Adjust if endpoint creation reports an access error.
+  - **Dashboard dimensions** for `MatchedEvents` (`EventBusName` + `RuleName`). If a widget stays empty, open the metric in CloudWatch and copy its dimensions.
+  - `package.json` uses version ranges (`^3.700.0`); run `npm install` once in `src/create-order/` and commit the generated `package-lock.json` for reproducible builds.
+- **Idempotency is regional.** `orders` is a normal regional table. The same `orderId` sent to *both* Regions can be created once per Region (DynamoDB global tables use last-writer-wins, so a conditional write cannot guarantee uniqueness across Regions). Clients should retry against the same Region unless it is down.
+- **At-least-once, not exactly-once.** If CreateOrder crashes after publishing but before marking the order `COMPLETED`, the retry publishes the event again. Every event carries `idempotencyKey = orderId`, and FulfilOrder ignores duplicates the same way. A stricter variant would use the transactional-outbox pattern (DynamoDB Streams → EventBridge Pipes).
+- **Global endpoints give automatic *ingestion* failover plus replication; they do not route customer traffic.** For real active-active client traffic add a Route 53 latency/weighted record in front of the two API URLs (needs a domain). Event processing, however, is active in both Regions because of replication.
+- **Failover/recovery time** documented by AWS for the recommended alarm settings is about 6 minutes (360 s, max 420 s). Producers can see `PutEvents` errors in that window: use retries with backoff.
+- **Health-check alarm and quiet traffic.** `HealthCheckTreatMissingData=missing` (default) keeps the last known state when no events flow, so a quiet lab does not fail over. Set `breaching` only for steady production traffic.
+- Order messages go through a *standard* SQS queue (at-least-once, unordered); that is why the consumer is idempotent.
+- The earlier DAX / API-cache design of this project is not part of these nine steps and was removed (DAX bills per hour and needs a VPC). The previous version is still in `orders-app.zip`.

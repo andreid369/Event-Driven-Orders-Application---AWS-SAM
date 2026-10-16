@@ -1,14 +1,31 @@
 version = 0.1
 
+# Default environment = PRIMARY Region.  Secondary Region: add  --config-env secondary
+# Single-Region mode (steps 1-8) is the default: EnableGlobalEndpoint=false.
+# Multi-Region (step 9): see README "Deploy procedure" - the secondary stack is deployed first.
+
 [default.global.parameters]
 stack_name = "orders-app"
 
 [default.validate.parameters]
 lint = true
 
+[default.build.parameters]
+cached = false
+
 [default.deploy.parameters]
-capabilities = "CAPABILITY_IAM"
-confirm_changeset = true
-resolve_s3 = true
-# Change to the region you want to use (check that DAX is available there).
 region = "eu-central-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+parameter_overrides = "RegionRole=primary PeerRegion=eu-west-1 EnableGlobalEndpoint=false"
+
+[secondary.global.parameters]
+stack_name = "orders-app"
+
+[secondary.deploy.parameters]
+region = "eu-west-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+parameter_overrides = "RegionRole=secondary PeerRegion=eu-central-1"

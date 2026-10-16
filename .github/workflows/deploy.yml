@@ -1,8 +1,14 @@
 name: Deploy SAM application
 
 # Step 5 - runs on every push to main (and can be started by hand).
-# Required repository secrets : AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
-# Optional repository variables: ENABLE_DAX, ENABLE_API_CACHE  ("true" / "false", default "false")
+#
+# Repository SECRETS (Settings > Secrets and variables > Actions > Secrets):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# Repository VARIABLES (optional, same page > Variables):
+#   PRIMARY_REGION      default eu-central-1
+#   SECONDARY_REGION    default eu-west-1
+#   MULTI_REGION        default "true"  ("false" = single Region, steps 1-8 only)
+#   NOTIFICATION_EMAIL  default empty   (address subscribed to the SNS topic)
 on:
   push:
     branches: [main]
@@ -11,18 +17,22 @@ on:
 permissions:
   contents: read
 
-# Never run two deployments of the same stack at once.
+# Never run two deployments of the same stacks at once.
 concurrency:
   group: deploy-orders-app
   cancel-in-progress: false
 
 env:
   STACK_NAME: orders-app
+  PRIMARY_REGION: ${{ vars.PRIMARY_REGION || 'eu-central-1' }}
+  SECONDARY_REGION: ${{ vars.SECONDARY_REGION || 'eu-west-1' }}
+  MULTI_REGION: ${{ vars.MULTI_REGION || 'true' }}
+  NOTIFICATION_EMAIL: ${{ vars.NOTIFICATION_EMAIL || '' }}
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45          # a DAX cluster alone can take ~20 minutes to create
+    runs-on: ubuntu-latest        # Linux x86_64: matches the Lambda architecture (CRT native library)
+    timeout-minutes: 30
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -37,38 +47,80 @@ jobs:
         with:
           use-installer: true
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (from GitHub secrets)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      # SAM bundles the function from a temporary copy of src/, where it does not see
-      # a dev dependency. esbuild must be on the PATH (SAM installs the DAX client itself).
-      - name: Install esbuild
-        run: npm install -g esbuild
+          aws-region: ${{ env.PRIMARY_REGION }}
 
       - name: Validate template
-        run: sam validate --lint
+        run: sam validate --lint --region "$PRIMARY_REGION"
 
-      - name: Build (esbuild bundle of the Lambda code)
+      # Packages the code: npm installs each function's dependencies (incl. the CRT library for CreateOrder).
+      - name: Build
         run: sam build
 
-      - name: Deploy (packages the code, uploads it to S3 and updates the stack and the function)
+      - name: Deploy
         run: |
-          sam deploy \
-            --stack-name "$STACK_NAME" \
-            --region "${{ secrets.AWS_REGION }}" \
-            --resolve-s3 \
-            --capabilities CAPABILITY_IAM \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              EnableDax=${{ vars.ENABLE_DAX || 'false' }} \
-              EnableApiCache=${{ vars.ENABLE_API_CACHE || 'false' }}
+          set -euo pipefail
+
+          deploy() {  # deploy <region> <parameter overrides...>
+            local region="$1"; shift
+            sam deploy \
+              --template-file .aws-sam/build/template.yaml \
+              --stack-name "$STACK_NAME" \
+              --region "$region" \
+              --resolve-s3 \
+              --capabilities CAPABILITY_IAM \
+              --no-confirm-changeset \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides "$@"
+          }
+
+          endpoint_id() {  # EndpointId output of the primary stack ("" when it does not exist yet)
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$PRIMARY_REGION" \
+              --query "Stacks[0].Outputs[?OutputKey=='GlobalEndpointId'].OutputValue" --output text 2>/dev/null \
+              | grep -v '^None$' || true
+          }
+
+          # Optional parameters are only passed when they have a value (an empty "Key=" override is rejected).
+          opt_email=()
+          if [ -n "$NOTIFICATION_EMAIL" ]; then opt_email=("NotificationEmail=$NOTIFICATION_EMAIL"); fi
+
+          if [ "$MULTI_REGION" != "true" ]; then
+            deploy "$PRIMARY_REGION" RegionRole=primary EnableGlobalEndpoint=false "${opt_email[@]}"
+            exit 0
+          fi
+
+          deploy_secondary() {  # deploy_secondary <endpoint id or empty>
+            local opt_ep=()
+            if [ -n "$1" ]; then opt_ep=("GlobalEndpointId=$1"); fi
+            deploy "$SECONDARY_REGION" RegionRole=secondary PeerRegion="$PRIMARY_REGION" "${opt_ep[@]}" "${opt_email[@]}"
+          }
+
+          # The global endpoint needs the event bus of BOTH Regions, so: secondary -> primary -> secondary again.
+          EP_BEFORE="$(endpoint_id)"
+          echo "::group::1/3 secondary Region ($SECONDARY_REGION)"
+          deploy_secondary "$EP_BEFORE"
+          echo "::endgroup::"
+
+          echo "::group::2/3 primary Region ($PRIMARY_REGION) + global endpoint"
+          deploy "$PRIMARY_REGION" RegionRole=primary PeerRegion="$SECONDARY_REGION" EnableGlobalEndpoint=true "${opt_email[@]}"
+          echo "::endgroup::"
+
+          EP_AFTER="$(endpoint_id)"
+          echo "global endpoint id: $EP_AFTER"
+          if [ "$EP_AFTER" != "$EP_BEFORE" ]; then
+            echo "::group::3/3 secondary Region again (learns the global endpoint id)"
+            deploy_secondary "$EP_AFTER"
+            echo "::endgroup::"
+          fi
 
       - name: Show stack outputs
         run: |
-          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-            --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table
+          for r in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
+            echo "== $r"
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$r" \
+              --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table || true
+          done

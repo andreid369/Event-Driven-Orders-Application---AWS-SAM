@@ -1,0 +1,11 @@
+{
+  "name": "create-order",
+  "version": "2.0.0",
+  "private": true,
+  "description": "CreateOrder Lambda: idempotent order creation + OrderCreated event via EventBridge global endpoint",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-eventbridge": "^3.700.0",
+    "@aws-sdk/signature-v4-crt": "^3.700.0"
+  }
+}
