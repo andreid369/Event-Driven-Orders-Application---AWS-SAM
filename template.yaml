@@ -534,7 +534,7 @@ Resources:
   OrdersDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
-      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardName: !Sub '${AWS::StackName}-${AWS::Region}-dashboard'   # dashboards are account-wide: the name must differ per Region
       DashboardBody: !Sub |
         {
           "widgets": [
@@ -580,4 +580,4 @@ Outputs:
     Description: Pass this to the secondary stack as GlobalEndpointId
     Value: !GetAtt GlobalEndpoint.EndpointId
   DashboardUrl:
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-${AWS::Region}-dashboard'
