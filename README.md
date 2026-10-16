@@ -4,11 +4,11 @@ Orders come in through API Gateway, are queued in SQS, processed idempotently by
 Amazon EventBridge (through a **global endpoint**), fanned out to a fulfilment queue and an SNS topic, and the whole
 application runs in **two AWS Regions**. It is deployed from your computer or, on every push to `main`, from GitHub Actions.
 
-> **Status – read this first.** The template, workflow and Lambda code were checked offline only: the YAML parses and
-> every reference resolves, the JavaScript passes a syntax check, and the idempotency / concurrency / batch-failure logic
-> passes an in-memory test. **Nothing has been deployed to a real AWS account** (the SAM CLI, cfn-lint and npm were not
-> reachable from the build environment). Expect to fix a small thing or two on the first real deployment; §7 lists the
-> parts I am least sure about.
+> **Status.** The stacks have been **deployed successfully in both Regions** through GitHub Actions (secondary →
+> primary with the global endpoint → secondary). Getting there took a few fixes that are now in the template: see §8
+> *Troubleshooting*. The idempotency / concurrency / batch-failure logic of the Lambda code passes an in-memory test.
+> The runtime tests in §4.5 (orders, dead-letter queue, replication, dashboard) are the next thing to run; §7 lists what
+> is still unverified.
 
 ---
 
@@ -114,7 +114,7 @@ Restrictions and traps specific to this project:
 
 ## 3. Prerequisites
 
-- An AWS account and an IAM user for deployments (access keys; `AdministratorAccess` is simplest for a lab).
+- An AWS account and an IAM user for deployments, with access keys. Either attach `AdministratorAccess` (simplest for a lab) or the narrower inline policy in `deploy-policy.json` (see §5.2).
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), Node.js 22, Git, a GitHub account.
 - **Windows users (PowerShell):** the commands below are single-line so they work in PowerShell, cmd and bash. Use `curl.exe` (not the `curl` alias). Build with Docker: `sam build --use-container` (needs Docker Desktop), because the CreateOrder function includes a native library (AWS CRT) that must be built for Linux. Deploying through GitHub Actions (§5) avoids this entirely.
 
@@ -124,6 +124,7 @@ Project layout:
 .
 ├── template.yaml                  # all AWS resources (steps 1-4, 6-9)
 ├── samconfig.toml                 # stack name, Regions, defaults for sam deploy
+├── deploy-policy.json             # IAM policy for the deployment user (alternative to AdministratorAccess)
 ├── events/order.json              # sample request body (+ invalid-order.json for the 400 test)
 ├── src/
 │   ├── create-order/              # CreateOrder (idempotent, publishes via global endpoint) + package.json (CRT)
@@ -248,7 +249,7 @@ aws sqs get-queue-attributes --queue-url <OrdersDeadLetterQueueUrl output> --att
 
 **f) Multi-Region** – post an order to the **secondary** API URL. Because the event goes through the global endpoint and is replicated, the order record is in the secondary Region's `orders` table, and a fulfilment row appears in **both** Regions' `orders-app-fulfilment` tables.
 
-**g) Dashboard** – open the `DashboardUrl` output (CloudWatch → Dashboards): MatchedEvents, NumberOfMessagesSent, NumberOfMessagesPublished. Metrics appear after a few minutes.
+**g) Dashboard** – open the `DashboardUrl` output (CloudWatch → Dashboards). There is one dashboard per Region, named `orders-app-<region>-dashboard` (dashboard names are account-wide, so the Region is part of the name). It shows MatchedEvents, NumberOfMessagesSent, NumberOfMessagesPublished and the dead-letter queues. Metrics appear after a few minutes.
 
 ---
 
@@ -268,7 +269,14 @@ Never commit AWS keys (`.gitignore` already excludes `.aws-sam/` and `node_modul
 
 ### Step 5.2 – Create deployment credentials in AWS
 
-IAM → Users → *Create user* `github-sam-deployer` → attach `AdministratorAccess` (lab; tighten later) → *Security credentials* → *Create access key* (use case: *Application running outside AWS*).
+IAM → Users → *Create user* (for example `github-sam-deployer`) → give it permissions, either:
+
+- **`AdministratorAccess`** (simplest, lab only), or
+- **the inline policy in `deploy-policy.json`**: *Add permissions → Create inline policy → JSON*, paste the file. It allows CloudFormation, Lambda, API Gateway, SQS, SNS, EventBridge, DynamoDB, CloudWatch/Logs, Route 53 and X-Ray, S3 only for SAM's artifact buckets, and IAM only for roles named `orders-app-*`. If a deployment fails with `AccessDenied`, the log names the missing action: add it to the policy.
+
+Then *Security credentials* → *Create access key* (use case: *Application running outside AWS*).
+
+Without enough permissions the first deployment fails in `ROLLBACK_FAILED`, which needs manual clean-up (§8).
 
 ### Step 5.3 – Store them as GitHub repository secrets
 
@@ -291,6 +299,8 @@ Repository → *Settings → Secrets and variables → Actions*:
 2. `sam validate --lint`, then `sam build` (packages every function with its npm dependencies)
 3. `sam deploy` **secondary → primary → secondary (again, only if the endpoint id changed)** – the same order as §4.4
 4. prints the outputs of both stacks
+
+If a `sam deploy` fails, the workflow also prints a **diagnostics** block: the stack status, the failed stack events (the earliest `CREATE_FAILED` is the root cause) and, for change-set failures, the validation events. Read that block first.
 
 Pushing a change to a Lambda file re-packages and updates that function; pushing a template change updates the stacks. An unchanged push ends green (`--no-fail-on-empty-changeset`). The first run takes a few minutes longer (endpoint creation).
 
@@ -329,6 +339,7 @@ An idle stack has almost no cost (queues, SNS, event buses, Lambda are pay-per-u
    aws sqs list-queues --region eu-central-1
    aws dynamodb list-tables --region eu-central-1
    aws logs describe-log-groups --log-group-name-prefix /aws/lambda/orders-app --region eu-central-1
+   aws cloudwatch list-dashboards
    ```
    Also look at Billing → *Bills* and *Free Tier usage* the next day. Route 53 → *Health checks* must be empty.
 
@@ -340,9 +351,9 @@ Re-activate the IAM access key, re-enable the workflow, then push or run it manu
 
 ## 7. Design notes and known limits
 
-- **Not run end-to-end** (see the status note at the top). Parts I could not verify against a live account:
-  - **Native CRT library.** `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). I expect the npm package to ship Linux prebuilt binaries, and the Lambda is set to `x86_64` to match the GitHub runner, but I could not install it here. If CreateOrder fails at cold start with a CRT / `signature-v4-crt` error, that is the place to look (build with `sam build --use-container`).
-  - **Replication role permissions** (`events:PutEvents` on both buses, trust `events.amazonaws.com`) are my reading of the docs, which did not list the policy. Adjust if endpoint creation reports an access error.
+- **Deployment is confirmed; runtime behaviour is not yet.** Still unverified (run §4.5 to find out):
+  - **Native CRT library.** `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). The Lambda is `x86_64` to match the GitHub runner. If CreateOrder fails at cold start or in `PutEvents` with a CRT / `signature-v4-crt` error, look at its CloudWatch log first (build with `sam build --use-container` if you deploy from your own machine).
+  - **Replication role permissions.** AWS did not document the policy; the first deployment failed with *"does not grant EventBridge the PutRule permission"*. The role now allows `PutEvents`, rule/target management on the `orders-bus` rules, and `iam:PassRole` to `events.amazonaws.com`. If the endpoint later reports another access error, add the action it names to `EndpointReplicationRole`.
   - **Dashboard dimensions** for `MatchedEvents` (`EventBusName` + `RuleName`). If a widget stays empty, open the metric in CloudWatch and copy its dimensions.
   - `package.json` uses version ranges (`^3.700.0`); run `npm install` once in `src/create-order/` and commit the generated `package-lock.json` for reproducible builds.
 - **Idempotency is regional.** `orders` is a normal regional table. The same `orderId` sent to *both* Regions can be created once per Region (DynamoDB global tables use last-writer-wins, so a conditional write cannot guarantee uniqueness across Regions). Clients should retry against the same Region unless it is down.
@@ -352,3 +363,23 @@ Re-activate the IAM access key, re-enable the workflow, then push or run it manu
 - **Health-check alarm and quiet traffic.** `HealthCheckTreatMissingData=missing` (default) keeps the last known state when no events flow, so a quiet lab does not fail over. Set `breaching` only for steady production traffic.
 - Order messages go through a *standard* SQS queue (at-least-once, unordered); that is why the consumer is idempotent.
 - The earlier DAX / API-cache design of this project is not part of these nine steps and was removed (DAX bills per hour and needs a VPC). The previous version is still in `orders-app.zip`.
+
+---
+
+## 8. Troubleshooting (problems met during the first deployment)
+
+Always start with the **diagnostics block** at the end of a failed workflow log, or run
+`aws cloudformation describe-stack-events --stack-name orders-app --region <region> --query "reverse(StackEvents[?contains(ResourceStatus,'FAILED')].[Timestamp,LogicalResourceId,ResourceStatusReason])" --output text`.
+The **earliest** `CREATE_FAILED` row is the cause; later "Resource creation cancelled" rows are side effects.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `AccessDenied ... not authorized to perform: sqs:CreateQueue / SNS:GetTopicAttributes / events:DescribeEventBus` | The deployment IAM user lacks permissions. The rollback then fails too. | Attach `AdministratorAccess` or `deploy-policy.json` (§5.2); delete the stuck stack (next row); re-run. |
+| Stack in `ROLLBACK_FAILED` or `ROLLBACK_COMPLETE`, or workflow says it cannot update the stack | A failed first creation. Such a stack cannot be updated, only deleted. | CloudFormation → the stack → *Delete* (or `aws cloudformation delete-stack --stack-name orders-app --region <region>`). If it fails on one resource, delete with *retain* for it, then remove that resource by hand. |
+| `Failed to create changeset ... AWS::EarlyValidation::ResourceExistenceCheck` | A resource with the same **name** already exists. Names are explicit in this template. | Use the change-set events to find the name: `aws cloudformation list-change-sets --stack-name orders-app --region <region> --query "Summaries[?Status=='FAILED'].ChangeSetId" --output text`, then `aws cloudformation describe-events --change-set-name <id> --region <region>`. Delete the leftover or rename. |
+| ... caused by the **dashboard** | CloudWatch dashboard names are account-wide, so the same name in two Regions collides. | Already fixed: the name contains the Region (`orders-app-<region>-dashboard`). |
+| ... caused by a leftover **global endpoint** `orders-app-endpoint` in `CREATE_FAILED` | A failed creation can leave the endpoint behind. | `aws events delete-endpoint --name orders-app-endpoint --region <primary>`, wait until `aws events list-endpoints --region <primary>` is empty, re-run. |
+| Endpoint `CREATE_FAILED`: *role does not grant EventBridge the PutRule permission* | Replication role too narrow. | Already fixed in the template (§7). |
+| `sam validate --lint` fails on the template | cfn-lint treats warnings as errors. | Fix the warning it names (e.g. a parameter default that does not match its pattern). |
+| Messages end up in the dead-letter queue although the code is fine | Lambda throttling (low account concurrency) or a poison message. | Check *Service Quotas → Lambda concurrency*; keep `QueueConsumerConcurrency` low; inspect the DLQ message and the function log. |
+
