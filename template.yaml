@@ -503,11 +503,31 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
+              - Sid: SendReplicatedEvents
+                Effect: Allow
                 Action: events:PutEvents
                 Resource:
                   - !GetAtt OrderBus.Arn
                   - !Sub 'arn:${AWS::Partition}:events:${PeerRegion}:${AWS::AccountId}:event-bus/${EventBusName}'
+              - Sid: ManageReplicationRules              # the endpoint creates managed replication rules on the buses
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+                  - events:EnableRule
+                  - events:DisableRule
+                  - events:RemoveTargets
+                  - events:DeleteRule
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/${EventBusName}/*'
+              - Sid: PassReplicationRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-EndpointReplicationRole-*'
+                Condition:
+                  StringEquals: {'iam:PassedToService': events.amazonaws.com}
 
   GlobalEndpoint:
     Type: AWS::Events::Endpoint
