@@ -337,13 +337,16 @@ Resources:
       Policies:
         - DynamoDBReadPolicy: {TableName: !Ref OrdersTable}
         - DynamoDBReadPolicy: {TableName: !Ref FulfilmentTable}
-      Events:
-        GetOrder:
-          Type: Api
-          Properties:
-            RestApiId: !Ref OrdersApi
-            Path: /orders/{orderId}
-            Method: get
+
+  # SAM did not add this route to the hand-written OpenAPI body of OrdersApi, so the route is declared there
+  # (/orders/{orderId} GET) and the invoke permission is explicit.
+  GetOrderApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetOrderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/GET/orders/*'
 
   # =========================================================================
   # Step 6: REST API - validates the request, puts it on SQS and answers 202 immediately
@@ -429,6 +432,22 @@ Resources:
                     statusCode: '502'
                     responseTemplates:
                       application/json: '{"message":"Could not queue the order, try again"}'
+          /orders/{orderId}:
+            get:
+              summary: Order status and fulfilment record
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: Order found}
+                '400': {description: Invalid orderId}
+                '404': {description: Not found (or not processed yet)}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetOrderFunction.Arn}/invocations'
         components:
           schemas:
             CreateOrderRequest:
