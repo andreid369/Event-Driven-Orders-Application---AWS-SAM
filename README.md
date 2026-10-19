@@ -7,8 +7,9 @@ application runs in **two AWS Regions**. It is deployed from your computer or, o
 > **Status.** The stacks have been **deployed successfully in both Regions** through GitHub Actions (secondary →
 > primary with the global endpoint → secondary). Getting there took a few fixes that are now in the template: see §8
 > *Troubleshooting*. The idempotency / concurrency / batch-failure logic of the Lambda code passes an in-memory test.
-> The runtime tests in §4.5 (orders, dead-letter queue, replication, dashboard) are the next thing to run; §7 lists what
-> is still unverified.
+> The runtime tests in §4.5 (order creation, validation, idempotency, dead-letter queue, status endpoint, Region
+> replication, dashboard) were run on the deployed stacks and passed. One bug was found by them and fixed: the
+> `GET /orders/{orderId}` route was missing from the API (§8).
 
 ---
 
@@ -349,10 +350,10 @@ Re-activate the IAM access key, re-enable the workflow, then push or run it manu
 
 ## 7. Design notes and known limits
 
-- **Deployment is confirmed; runtime behaviour is not yet.** Still unverified (run §4.5 to find out):
-  - **Native CRT library.** `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). The Lambda is `x86_64` to match the GitHub runner. If CreateOrder fails at cold start or in `PutEvents` with a CRT / `signature-v4-crt` error, look at its CloudWatch log first (build with `sam build --use-container` if you deploy from your own machine).
+- **Deployment and runtime behaviour are confirmed** by the §4.5 tests. Points to keep in mind if you change things:
+  - **Native CRT library** (works as deployed). `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). The Lambda is `x86_64` to match the GitHub runner. If CreateOrder fails at cold start or in `PutEvents` with a CRT / `signature-v4-crt` error, look at its CloudWatch log first (build with `sam build --use-container` if you deploy from your own machine).
   - **Replication role permissions.** AWS did not document the policy; the first deployment failed with *"does not grant EventBridge the PutRule permission"*. The role now allows `PutEvents`, rule/target management on the `orders-bus` rules, and `iam:PassRole` to `events.amazonaws.com`. If the endpoint later reports another access error, add the action it names to `EndpointReplicationRole`.
-  - **Dashboard dimensions** for `MatchedEvents` (`EventBusName` + `RuleName`). If a widget stays empty, open the metric in CloudWatch and copy its dimensions.
+  - **Dashboard dimensions** (verified) for `MatchedEvents` (`EventBusName` + `RuleName`). If a widget stays empty, open the metric in CloudWatch and copy its dimensions.
   - `package.json` uses version ranges (`^3.700.0`), but `package-lock.json` is committed, so builds install the same versions every time. Dependabot opens a weekly pull request when newer versions exist; a merge to `main` redeploys. `aws-crt` downloads or builds a platform-specific binary at install time, which is why the build must run on Linux x86_64 (GitHub Actions, or `sam build --use-container`).
 - **Idempotency is regional.** `orders` is a normal regional table. The same `orderId` sent to *both* Regions can be created once per Region (DynamoDB global tables use last-writer-wins, so a conditional write cannot guarantee uniqueness across Regions). Clients should retry against the same Region unless it is down.
 - **At-least-once, not exactly-once.** If CreateOrder crashes after publishing but before marking the order `COMPLETED`, the retry publishes the event again. Every event carries `idempotencyKey = orderId`, and FulfilOrder ignores duplicates the same way. A stricter variant would use the transactional-outbox pattern (DynamoDB Streams → EventBridge Pipes).
@@ -364,7 +365,7 @@ Re-activate the IAM access key, re-enable the workflow, then push or run it manu
 
 ---
 
-## 8. Troubleshooting (problems met during the first deployment)
+## 8. Troubleshooting (problems met while deploying and testing)
 
 Always start with the **diagnostics block** at the end of a failed workflow log, or run
 `aws cloudformation describe-stack-events --stack-name orders-app --region <region> --query "reverse(StackEvents[?contains(ResourceStatus,'FAILED')].[Timestamp,LogicalResourceId,ResourceStatusReason])" --output text`.
@@ -379,5 +380,6 @@ The **earliest** `CREATE_FAILED` row is the cause; later "Resource creation canc
 | ... caused by a leftover **global endpoint** `orders-app-endpoint` in `CREATE_FAILED` | A failed creation can leave the endpoint behind. | `aws events delete-endpoint --name orders-app-endpoint --region <primary>`, wait until `aws events list-endpoints --region <primary>` is empty, re-run. |
 | Endpoint `CREATE_FAILED`: *role does not grant EventBridge the PutRule permission* | Replication role too narrow. | Already fixed in the template (§7). |
 | `sam validate --lint` fails on the template | cfn-lint treats warnings as errors. | Fix the warning it names (e.g. a parameter default that does not match its pattern). |
+| `GET /orders/{orderId}` answers `{"message":"Missing Authentication Token"}` | API Gateway's generic answer for a route that does not exist. SAM did not add the `GetOrder` event to the hand-written OpenAPI body, so only `POST /orders` was deployed. | Already fixed: the route and its Lambda permission are declared explicitly in `OrdersApi` (`/orders/{orderId}` → `GetOrderFunction`). Check with `aws apigateway get-resources --rest-api-id <id> --region <region>`. |
 | Messages end up in the dead-letter queue although the code is fine | Lambda throttling (low account concurrency) or a poison message. | Check *Service Quotas → Lambda concurrency*; keep `QueueConsumerConcurrency` low; inspect the DLQ message and the function log. |
 
