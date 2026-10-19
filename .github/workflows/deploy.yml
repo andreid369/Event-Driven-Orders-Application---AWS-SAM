@@ -12,6 +12,7 @@ name: Deploy SAM application
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
 permissions:
@@ -65,9 +66,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          diagnose() {  # print WHY a change set failed (e.g. EarlyValidation: which resource already exists)
+            echo "::group::diagnostics for $1"
+            echo "--- failed stack events (the first one by time is the root cause) ---"
+            aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$1" \
+              --query "reverse(StackEvents[?contains(ResourceStatus,'FAILED')].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason])" \
+              --output text || true
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$1" \
+              --query "Stacks[0].StackStatus" --output text || true
+            for cs in $(aws cloudformation list-change-sets --stack-name "$STACK_NAME" --region "$1" \
+                          --query "Summaries[?Status=='FAILED'].ChangeSetId" --output text 2>/dev/null); do
+              aws cloudformation describe-change-set --change-set-name "$cs" --region "$1" \
+                --query "StatusReason" --output text || true
+              aws cloudformation describe-events --change-set-name "$cs" --region "$1" --output json || true
+            done
+            echo "::endgroup::"
+          }
+
           deploy() {  # deploy <region> <parameter overrides...>
             local region="$1"; shift
-            sam deploy \
+            if ! sam deploy \
               --template-file .aws-sam/build/template.yaml \
               --stack-name "$STACK_NAME" \
               --region "$region" \
@@ -75,7 +93,10 @@ jobs:
               --capabilities CAPABILITY_IAM \
               --no-confirm-changeset \
               --no-fail-on-empty-changeset \
-              --parameter-overrides "$@"
+              --parameter-overrides "$@"; then
+              diagnose "$region"
+              return 1
+            fi
           }
 
           endpoint_id() {  # EndpointId output of the primary stack ("" when it does not exist yet)
