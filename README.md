@@ -16,22 +16,15 @@ application runs in **two AWS Regions**. It is deployed from your computer or, o
 
 ### 1.1 What it does
 
-```mermaid
-flowchart LR
-  C([Client]) -- "POST /orders" --> APIGW["API Gateway<br/>validates body, answers 202"]
-  APIGW -- SendMessage --> OQ[("SQS orders queue")]
-  OQ -. "3 failed receives" .-> DLQ[("Dead-letter queue")]
-  OQ --> CO["Lambda CreateOrder<br/>idempotent on orderId"]
-  CO <--> OT[("DynamoDB Orders")]
-  CO -- "PutEvents OrderCreated" --> GE{{"EventBridge<br/>global endpoint"}}
-  GE --> PB["Event bus (primary Region)"]
-  GE -. "failover + replication" .-> SB["Event bus (secondary Region)"]
-  PB -- rule --> FQ[("SQS fulfilment queue")] --> FO["Lambda FulfilOrder"] --> FT[("DynamoDB Fulfilment")]
-  PB -- rule --> SNS["SNS order notifications"]
-```
+![Architecture: client, API Gateway, SQS, Lambda, DynamoDB, EventBridge, SNS in two Regions with a global endpoint](docs/architecture.png)
 
-The diagram shows one Region. The **same stack is deployed in both Regions**, so each Region has its own API Gateway,
-Lambda functions, event bus, SQS queues, SNS topic, DynamoDB tables and dashboard.
+*Solid arrows: requests and events. Dashed red: health check, replication and failover. `GetOrder` answers `GET /orders/{orderId}` (the status check after the 202). Each Region also has a CloudWatch dashboard. Editable vector version: [`docs/architecture.svg`](docs/architecture.svg).*
+
+
+The **same stack is deployed in both Regions**, so each Region has its own API Gateway, Lambda functions, event bus, SQS queues,
+SNS topic, DynamoDB tables and dashboard. The global endpoint and the Route 53 health check are created once, in the primary Region
+(red dashed lines = replication and failover). Orders are created through the API Gateway of one Region; the global endpoint
+decides which Region's bus receives the `OrderCreated` events.
 
 | Item | Detail |
 |---|---|
@@ -127,10 +120,13 @@ Project layout:
 ├── deploy-policy.json             # IAM policy for the deployment user (alternative to AdministratorAccess)
 ├── events/order.json              # sample request body (+ invalid-order.json for the 400 test)
 ├── src/
-│   ├── create-order/              # CreateOrder (idempotent, publishes via global endpoint) + package.json (CRT)
+│   ├── create-order/              # CreateOrder (idempotent, publishes via global endpoint) + package.json and package-lock.json (CRT)
 │   ├── fulfil-order/              # FulfilOrder (SQS consumer)
 │   └── get-order/                 # GET /orders/{orderId}
-├── .github/workflows/deploy.yml   # CI/CD (step 5)
+├── docs/architecture.png          # architecture diagram (+ architecture.svg, vector)
+├── .github/
+│   ├── workflows/deploy.yml       # CI/CD (step 5)
+│   └── dependabot.yml             # weekly dependency update PRs (npm + GitHub Actions)
 └── README.md
 ```
 
@@ -293,6 +289,8 @@ Repository → *Settings → Secrets and variables → Actions*:
 
 ### Step 5.4 – What the workflow does
 
+The workflow ignores pushes that only change `*.md` files or `docs/`, so README edits do not trigger a deployment (run it by hand from the *Actions* tab if you ever need to).
+
 `.github/workflows/deploy.yml` runs on every push to `main` (and manually: *Actions → Run workflow*):
 
 1. check out, set up Node 22 and SAM CLI, load the AWS credentials from the secrets
@@ -355,14 +353,14 @@ Re-activate the IAM access key, re-enable the workflow, then push or run it manu
   - **Native CRT library.** `PutEvents` through a global endpoint is signed with SigV4A, which the JavaScript SDK does through `aws-crt` (native code). The Lambda is `x86_64` to match the GitHub runner. If CreateOrder fails at cold start or in `PutEvents` with a CRT / `signature-v4-crt` error, look at its CloudWatch log first (build with `sam build --use-container` if you deploy from your own machine).
   - **Replication role permissions.** AWS did not document the policy; the first deployment failed with *"does not grant EventBridge the PutRule permission"*. The role now allows `PutEvents`, rule/target management on the `orders-bus` rules, and `iam:PassRole` to `events.amazonaws.com`. If the endpoint later reports another access error, add the action it names to `EndpointReplicationRole`.
   - **Dashboard dimensions** for `MatchedEvents` (`EventBusName` + `RuleName`). If a widget stays empty, open the metric in CloudWatch and copy its dimensions.
-  - `package.json` uses version ranges (`^3.700.0`); run `npm install` once in `src/create-order/` and commit the generated `package-lock.json` for reproducible builds.
+  - `package.json` uses version ranges (`^3.700.0`), but `package-lock.json` is committed, so builds install the same versions every time. Dependabot opens a weekly pull request when newer versions exist; a merge to `main` redeploys. `aws-crt` downloads or builds a platform-specific binary at install time, which is why the build must run on Linux x86_64 (GitHub Actions, or `sam build --use-container`).
 - **Idempotency is regional.** `orders` is a normal regional table. The same `orderId` sent to *both* Regions can be created once per Region (DynamoDB global tables use last-writer-wins, so a conditional write cannot guarantee uniqueness across Regions). Clients should retry against the same Region unless it is down.
 - **At-least-once, not exactly-once.** If CreateOrder crashes after publishing but before marking the order `COMPLETED`, the retry publishes the event again. Every event carries `idempotencyKey = orderId`, and FulfilOrder ignores duplicates the same way. A stricter variant would use the transactional-outbox pattern (DynamoDB Streams → EventBridge Pipes).
 - **Global endpoints give automatic *ingestion* failover plus replication; they do not route customer traffic.** For real active-active client traffic add a Route 53 latency/weighted record in front of the two API URLs (needs a domain). Event processing, however, is active in both Regions because of replication.
 - **Failover/recovery time** documented by AWS for the recommended alarm settings is about 6 minutes (360 s, max 420 s). Producers can see `PutEvents` errors in that window: use retries with backoff.
 - **Health-check alarm and quiet traffic.** `HealthCheckTreatMissingData=missing` (default) keeps the last known state when no events flow, so a quiet lab does not fail over. Set `breaching` only for steady production traffic.
 - Order messages go through a *standard* SQS queue (at-least-once, unordered); that is why the consumer is idempotent.
-- The earlier DAX / API-cache design of this project is not part of these nine steps and was removed (DAX bills per hour and needs a VPC). The previous version is still in `orders-app.zip`.
+- The earlier DAX / API-cache design of this project is not part of these nine steps and was removed (DAX bills per hour and needs a VPC). It is no longer in the repository (see the Git history if you need it).
 
 ---
 
