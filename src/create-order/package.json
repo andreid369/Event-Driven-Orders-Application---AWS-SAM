@@ -6,6 +6,6 @@
   "main": "index.js",
   "dependencies": {
     "@aws-sdk/client-eventbridge": "^3.1156.0",
-    "@aws-sdk/signature-v4-crt": "^3.700.0"
+    "@aws-sdk/signature-v4-crt": "^3.1157.0"
   }
 }
