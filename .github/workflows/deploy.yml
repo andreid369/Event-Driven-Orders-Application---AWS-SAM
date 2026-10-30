@@ -3,7 +3,7 @@ name: Deploy SAM application
 # Step 5 - runs on every push to main (and can be started by hand).
 #
 # Repository SECRETS (Settings > Secrets and variables > Actions > Secrets):
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   AWS_ROLE_TO_ASSUME (ARN of the IAM role GitHub assumes via OIDC)
 # Repository VARIABLES (optional, same page > Variables):
 #   PRIMARY_REGION      default eu-central-1
 #   SECONDARY_REGION    default eu-west-1
@@ -16,6 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  id-token: write   # required for AWS OIDC authentication
   contents: read
 
 # Never run two deployments of the same stacks at once.
@@ -51,8 +52,7 @@ jobs:
       - name: Configure AWS credentials (from GitHub secrets)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.PRIMARY_REGION }}
 
       - name: Validate template
